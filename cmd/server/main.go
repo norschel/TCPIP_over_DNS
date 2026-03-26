@@ -24,9 +24,10 @@ import (
 func main() {
 	addr := flag.String("addr", ":53", "address to listen on (UDP+TCP)")
 	domain := flag.String("domain", "tunnel.example.com", "DNS tunnel domain")
+	secret := flag.String("secret", "", "shared secret for authentication (empty = no auth)")
 	flag.Parse()
 
-	s := server.New(*domain)
+	s := server.New(*domain, *secret)
 	if err := s.ListenAndServe(*addr); err != nil {
 		log.Fatalf("server error: %v", err)
 	}

@@ -27,9 +27,10 @@ func main() {
 	proxy := flag.String("proxy", "127.0.0.1:1080", "SOCKS5 proxy listen address")
 	dns := flag.String("dns", "127.0.0.1:53", "DNS tunnel server address (host:port)")
 	domain := flag.String("domain", "tunnel.example.com", "DNS tunnel domain")
+	secret := flag.String("secret", "", "shared secret for authentication (empty = no auth)")
 	flag.Parse()
 
-	c := client.New(*domain, *dns)
+	c := client.New(*domain, *dns, *secret)
 	if err := c.ListenAndServe(*proxy); err != nil {
 		log.Fatalf("client error: %v", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,14 +54,18 @@ type session struct {
 // Server is the DNS tunnel server.
 type Server struct {
 	domain   string
+	secret   string // shared secret for HMAC authentication; empty = no auth
 	sessions map[string]*session
 	mu       sync.RWMutex
 }
 
 // New creates a new Server that handles queries for the given domain.
-func New(domain string) *Server {
+// secret is the shared authentication secret; pass an empty string to disable
+// authentication (any client can connect).
+func New(domain, secret string) *Server {
 	s := &Server{
 		domain:   domain,
+		secret:   secret,
 		sessions: make(map[string]*session),
 	}
 	go s.cleanupLoop()
@@ -115,6 +120,8 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 	var txt string
 	switch query.Cmd {
+	case protocol.CmdProbe:
+		txt = s.handleProbe(query)
 	case protocol.CmdConnect:
 		txt = s.handleConnect(query)
 	case protocol.CmdData:
@@ -139,6 +146,18 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		Txt: []string{txt},
 	})
 	_ = w.WriteMsg(m)
+}
+
+func (s *Server) handleProbe(q *protocol.Query) string {
+	if s.secret != "" {
+		expected := protocol.ComputeToken(s.secret, q.Session)
+		if !strings.EqualFold(q.Token, expected) {
+			log.Printf("[server] probe session=%s: auth failed", q.Session)
+			return protocol.RespError + ":auth"
+		}
+	}
+	log.Printf("[server] probe session=%s: OK", q.Session)
+	return protocol.RespOK
 }
 
 func (s *Server) handleConnect(q *protocol.Query) string {

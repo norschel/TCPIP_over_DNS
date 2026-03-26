@@ -49,15 +49,19 @@ type session struct {
 type Client struct {
 	domain    string
 	dnsServer string // host:port of the tunnel DNS server
+	secret    string // shared secret for HMAC authentication; empty = no auth
 	dnsClient *dns.Client
 }
 
 // New creates a new Client that tunnels through the given DNS server and domain.
 // dnsServer should be in "host:port" format (e.g. "192.168.1.1:53").
-func New(domain, dnsServer string) *Client {
+// secret is the shared authentication secret; pass an empty string if the
+// server is configured without authentication.
+func New(domain, dnsServer, secret string) *Client {
 	return &Client{
 		domain:    domain,
 		dnsServer: dnsServer,
+		secret:    secret,
 		dnsClient: &dns.Client{
 			Net:     "udp",
 			Timeout: 5 * time.Second,
@@ -66,7 +70,13 @@ func New(domain, dnsServer string) *Client {
 }
 
 // ListenAndServe starts the SOCKS5 proxy on addr (e.g. "127.0.0.1:1080").
+// It first runs a startup probe to verify reachability and authentication;
+// the proxy only starts accepting connections if the probe succeeds.
 func (c *Client) ListenAndServe(addr string) error {
+	if err := c.Probe(); err != nil {
+		return fmt.Errorf("startup probe: %w", err)
+	}
+
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", addr, err)
@@ -83,6 +93,53 @@ func (c *Client) ListenAndServe(addr string) error {
 		}
 		go c.handleConn(conn)
 	}
+}
+
+// Probe sends a single probe query to verify that the DNS tunnel server is
+// reachable and that the shared secret (if configured) is accepted.  It logs
+// the round-trip latency, authentication status, and an efficiency note.
+func (c *Client) Probe() error {
+	session := newSessionID()
+	qname := protocol.BuildProbeQuery(session, c.secret, c.domain)
+
+	authNote := "no-auth"
+	if c.secret != "" {
+		authNote = "hmac-sha256"
+	}
+
+	start := time.Now()
+	txt, err := c.queryTXT(qname)
+	latency := time.Since(start)
+
+	if err != nil {
+		log.Printf("[client] probe FAILED | server=%s domain=%s auth=%s error=%v",
+			c.dnsServer, c.domain, authNote, err)
+		return fmt.Errorf("probe DNS query: %w", err)
+	}
+
+	status, data, err := protocol.ParseResponse(txt)
+	if err != nil {
+		return fmt.Errorf("probe parse response: %w", err)
+	}
+
+	if status != protocol.RespOK {
+		msg := string(data)
+		log.Printf("[client] probe REJECTED | server=%s domain=%s auth=%s reason=%s",
+			c.dnsServer, c.domain, authNote, msg)
+		return fmt.Errorf("server rejected probe: %s", txt)
+	}
+
+	// Compute the encoding overhead of the probe QNAME as a rough efficiency
+	// indicator shown once at startup.
+	efficiency := "N/A"
+	if len(session) > 0 {
+		efficiency = fmt.Sprintf("%.0f%%", float64(len(session))*100/float64(len(qname)))
+	}
+
+	log.Printf("[client] probe OK | server=%s domain=%s auth=%s latency=%s qname_len=%d efficiency=%s",
+		c.dnsServer, c.domain, authNote,
+		latency.Round(time.Millisecond), len(qname), efficiency)
+	return nil
 }
 
 // handleConn processes a single SOCKS5 connection.

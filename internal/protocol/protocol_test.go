@@ -334,3 +334,58 @@ func TestBuildParseResponse_NoData(t *testing.T) {
 		}
 	}
 }
+
+// ─── Probe query ─────────────────────────────────────────────────────────────
+
+func TestBuildParseProbeQuery(t *testing.T) {
+domain := "tunnel.example.com"
+session := "cafef00d"
+secret := "mysecret"
+
+qname := protocol.BuildProbeQuery(session, secret, domain)
+
+// Must end with domain.
+if !strings.HasSuffix(qname, domain) {
+t.Fatalf("qname %q does not end with domain %q", qname, domain)
+}
+// All labels ≤63 characters.
+for _, label := range strings.Split(qname, ".") {
+if len(label) > 63 {
+t.Fatalf("label %q exceeds 63 chars", label)
+}
+}
+
+q, err := protocol.ParseQuery(qname+".", domain)
+if err != nil {
+t.Fatalf("ParseQuery: %v", err)
+}
+if q.Cmd != protocol.CmdProbe {
+t.Errorf("Cmd: want %q, got %q", protocol.CmdProbe, q.Cmd)
+}
+if q.Session != session {
+t.Errorf("Session: want %q, got %q", session, q.Session)
+}
+// Token must match what ComputeToken produces.
+expected := protocol.ComputeToken(secret, session)
+if !strings.EqualFold(q.Token, expected) {
+t.Errorf("Token: want %q, got %q", expected, q.Token)
+}
+}
+
+func TestComputeToken_DifferentSecrets(t *testing.T) {
+session := "aabbccdd"
+t1 := protocol.ComputeToken("secretA", session)
+t2 := protocol.ComputeToken("secretB", session)
+if t1 == t2 {
+t.Error("different secrets produced the same token")
+}
+}
+
+func TestComputeToken_DifferentSessions(t *testing.T) {
+secret := "mysecret"
+t1 := protocol.ComputeToken(secret, "session1")
+t2 := protocol.ComputeToken(secret, "session2")
+if t1 == t2 {
+t.Error("different sessions produced the same token")
+}
+}

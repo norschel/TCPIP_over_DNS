@@ -50,7 +50,7 @@ func startDNSServer(t *testing.T, domain string) (dnsAddr string) {
 	dnsAddr = pc.LocalAddr().String()
 	pc.Close()
 
-	srv := server.New(domain)
+	srv := server.New(domain, "" /* no auth */)
 	go func() {
 		// We ignore the error because the server is stopped by test cleanup.
 		_ = srv.ListenAndServe(dnsAddr)
@@ -223,4 +223,87 @@ func TestServerDuplicateDataQuery(t *testing.T) {
 	if !bytes.Equal(received, payload) {
 		t.Errorf("dedup test: want %q, got %q", payload, received)
 	}
+}
+
+// startDNSServerWithSecret starts the tunnel server configured with a shared secret.
+func startDNSServerWithSecret(t *testing.T, domain, secret string) (dnsAddr string) {
+t.Helper()
+
+pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+if err != nil {
+t.Fatalf("find free port: %v", err)
+}
+dnsAddr = pc.LocalAddr().String()
+pc.Close()
+
+srv := server.New(domain, secret)
+go func() {
+_ = srv.ListenAndServe(dnsAddr)
+}()
+time.Sleep(100 * time.Millisecond)
+return dnsAddr
+}
+
+// TestServerProbe_NoAuth verifies that a probe succeeds when the server has
+// no authentication configured.
+func TestServerProbe_NoAuth(t *testing.T) {
+const domain = "test.tunnel"
+dnsAddr := startDNSServer(t, domain)
+
+c := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
+
+session := "probe001"
+probeQ := protocol.BuildProbeQuery(session, "" /* no secret */, domain)
+resp := queryTXT(t, c, dnsAddr, probeQ)
+status, _, err := protocol.ParseResponse(resp)
+if err != nil {
+t.Fatalf("ParseResponse: %v", err)
+}
+if status != protocol.RespOK {
+t.Errorf("want OK, got %q", resp)
+}
+}
+
+// TestServerProbe_CorrectSecret verifies that a probe with the correct HMAC
+// token is accepted when the server requires a shared secret.
+func TestServerProbe_CorrectSecret(t *testing.T) {
+const (
+domain = "test.tunnel"
+secret = "supersecret"
+)
+dnsAddr := startDNSServerWithSecret(t, domain, secret)
+
+c := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
+
+session := "probe002"
+probeQ := protocol.BuildProbeQuery(session, secret, domain)
+resp := queryTXT(t, c, dnsAddr, probeQ)
+status, _, err := protocol.ParseResponse(resp)
+if err != nil {
+t.Fatalf("ParseResponse: %v", err)
+}
+if status != protocol.RespOK {
+t.Errorf("want OK, got %q", resp)
+}
+}
+
+// TestServerProbe_WrongSecret verifies that a probe with an incorrect HMAC
+// token is rejected when the server requires a shared secret.
+func TestServerProbe_WrongSecret(t *testing.T) {
+const (
+domain       = "test.tunnel"
+serverSecret = "supersecret"
+clientSecret = "wrongsecret"
+)
+dnsAddr := startDNSServerWithSecret(t, domain, serverSecret)
+
+c := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
+
+session := "probe003"
+probeQ := protocol.BuildProbeQuery(session, clientSecret, domain)
+resp := queryTXT(t, c, dnsAddr, probeQ)
+status, _, _ := protocol.ParseResponse(resp)
+if status != protocol.RespError {
+t.Errorf("want ERR for wrong secret, got %q", resp)
+}
 }

@@ -38,6 +38,8 @@ package protocol
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base32"
 	"fmt"
 	"io"
@@ -50,6 +52,10 @@ const (
 	CmdData    = "d"
 	CmdPoll    = "p"
 	CmdClose   = "x"
+	// CmdProbe is used for the startup connection probe and authentication
+	// handshake.  The client sends a probe before accepting any SOCKS5
+	// connections; the server validates the HMAC token and replies with OK.
+	CmdProbe = "h"
 )
 
 // Status tokens returned in the TXT response from the server.
@@ -153,6 +159,26 @@ func splitLabels(s string) []string {
 	return labels
 }
 
+// ComputeToken derives a fixed-length base32 authentication token from a
+// shared secret and a session identifier using HMAC-SHA256.  The first 16
+// bytes of the MAC are encoded, yielding a 26-character base32 string that
+// fits in a single DNS label.
+//
+// When secret is empty the function still returns a valid (but trivially
+// forgeable) token; the server skips validation when no secret is configured.
+func ComputeToken(secret, session string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(session))
+	return Encode(mac.Sum(nil)[:16])
+}
+
+// BuildProbeQuery returns the QNAME for the startup probe / authentication
+// handshake.  token = ComputeToken(secret, session).
+func BuildProbeQuery(session, secret, domain string) string {
+	token := ComputeToken(secret, session)
+	return fmt.Sprintf("%s.%s.%s.%s", CmdProbe, session, token, domain)
+}
+
 // BuildConnectQuery returns the QNAME for a connect request.
 func BuildConnectQuery(session, domain, host string, port uint16) string {
 	payload := Encode(compressPayload([]byte(fmt.Sprintf("%s:%d", host, port))))
@@ -183,7 +209,7 @@ func BuildCloseQuery(session, domain string) string {
 
 // Query is the parsed representation of a tunnel QNAME.
 type Query struct {
-	// Cmd is one of CmdConnect, CmdData, CmdPoll, CmdClose.
+	// Cmd is one of CmdConnect, CmdData, CmdPoll, CmdClose, CmdProbe.
 	Cmd string
 	// Session is the 8-character hex session identifier.
 	Session string
@@ -194,6 +220,8 @@ type Query struct {
 	// Host and Port are the upstream destination (CmdConnect only).
 	Host string
 	Port uint16
+	// Token is the HMAC authentication token (CmdProbe only).
+	Token string
 }
 
 // ParseQuery parses a DNS QNAME into a Query, stripping the given domain suffix.
@@ -277,6 +305,12 @@ func ParseQuery(qname, domain string) (*Query, error) {
 
 	case CmdClose:
 		// no additional fields required
+
+	case CmdProbe:
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("probe query missing token")
+		}
+		q.Token = parts[2]
 
 	default:
 		return nil, fmt.Errorf("unknown command %q", q.Cmd)
