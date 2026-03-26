@@ -42,7 +42,7 @@ type session struct {
 	downBytes    int64 // raw payload bytes received downstream (after decoding)
 	dataQueries  int64 // DNS data queries issued (carry upstream payload)
 	pollQueries  int64 // DNS poll queries issued (no payload)
-	qnameBytes   int64 // sum of QNAME lengths sent (DNS wire overhead proxy)
+	qnameBytes   int64 // sum of QNAME lengths sent (DNS wire overhead measure)
 }
 
 // Client is the DNS tunnel client / SOCKS5 proxy.

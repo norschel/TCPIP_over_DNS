@@ -21,11 +21,26 @@
 // Data is encoded with base32 (standard alphabet, no padding) so that every
 // character in a DNS label is in the range [A-Z2-7].  Labels are capped at 63
 // characters as required by RFC 1035.
+//
+// # Compression
+//
+// Every non-empty payload is run through an adaptive zlib compression step
+// before base32-encoding.  A single prefix byte is prepended to signal which
+// path was taken:
+//
+//	0x00 — raw (compression did not reduce the size)
+//	0x01 — zlib best-compression
+//
+// Both sides always apply compressPayload on encode and decompressPayload on
+// decode, so the format is self-describing and transparent to callers.
 package protocol
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/base32"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -54,6 +69,66 @@ const MaxUpstreamChunk = 100
 // enc is base32 without padding (padding '=' is invalid in a DNS label).
 var enc = base32.StdEncoding.WithPadding(base32.NoPadding)
 
+// compressPayload prepends a 1-byte flag and optionally compresses data with
+// zlib BestCompression before base32 encoding:
+//
+//	0x00 prefix — raw copy (compression would have made the payload larger)
+//	0x01 prefix — zlib-compressed
+//
+// Empty input is returned as nil so that zero-length payloads continue to
+// round-trip as empty base32 strings.
+func compressPayload(data []byte) []byte {
+	if len(data) == 0 {
+		return nil
+	}
+
+	var buf bytes.Buffer
+	w, _ := zlib.NewWriterLevel(&buf, zlib.BestCompression)
+	_, _ = w.Write(data)
+	_ = w.Close()
+
+	if buf.Len() < len(data) {
+		// Compression helped: return 0x01 || compressed.
+		result := make([]byte, 1+buf.Len())
+		result[0] = 0x01
+		copy(result[1:], buf.Bytes())
+		return result
+	}
+
+	// Compression did not help: return 0x00 || raw.
+	result := make([]byte, 1+len(data))
+	result[0] = 0x00
+	copy(result[1:], data)
+	return result
+}
+
+// decompressPayload reverses compressPayload. It reads the flag byte and either
+// returns the raw payload or decompresses it with zlib.
+// Empty input is returned as nil (matching compressPayload's behaviour).
+func decompressPayload(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	flag, payload := data[0], data[1:]
+	switch flag {
+	case 0x00:
+		return payload, nil
+	case 0x01:
+		r, err := zlib.NewReader(bytes.NewReader(payload))
+		if err != nil {
+			return nil, fmt.Errorf("zlib new reader: %w", err)
+		}
+		defer r.Close()
+		out, err := io.ReadAll(r)
+		if err != nil {
+			return nil, fmt.Errorf("zlib decompress: %w", err)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unknown compression flag %#x", flag)
+	}
+}
+
 // Encode returns the base32-encoded representation of data.
 func Encode(data []byte) string {
 	return enc.EncodeToString(data)
@@ -80,7 +155,7 @@ func splitLabels(s string) []string {
 
 // BuildConnectQuery returns the QNAME for a connect request.
 func BuildConnectQuery(session, domain, host string, port uint16) string {
-	payload := Encode([]byte(fmt.Sprintf("%s:%d", host, port)))
+	payload := Encode(compressPayload([]byte(fmt.Sprintf("%s:%d", host, port))))
 	parts := []string{CmdConnect, session}
 	parts = append(parts, splitLabels(payload)...)
 	parts = append(parts, domain)
@@ -89,7 +164,7 @@ func BuildConnectQuery(session, domain, host string, port uint16) string {
 
 // BuildDataQuery returns the QNAME for an upstream data transfer.
 func BuildDataQuery(session string, seq uint32, data []byte, domain string) string {
-	payload := Encode(data)
+	payload := Encode(compressPayload(data))
 	parts := []string{CmdData, session, fmt.Sprintf("%08x", seq)}
 	parts = append(parts, splitLabels(payload)...)
 	parts = append(parts, domain)
@@ -149,9 +224,13 @@ func ParseQuery(qname, domain string) (*Query, error) {
 			return nil, fmt.Errorf("connect query missing payload")
 		}
 		b32 := strings.Join(parts[2:], "")
-		data, err := Decode(b32)
+		compressed, err := Decode(b32)
 		if err != nil {
 			return nil, fmt.Errorf("decode connect payload: %w", err)
+		}
+		data, err := decompressPayload(compressed)
+		if err != nil {
+			return nil, fmt.Errorf("decompress connect payload: %w", err)
 		}
 		addr := string(data)
 		idx := strings.LastIndex(addr, ":")
@@ -176,11 +255,14 @@ func ParseQuery(qname, domain string) (*Query, error) {
 		q.Seq = uint32(seq)
 		if len(parts) > 3 {
 			b32 := strings.Join(parts[3:], "")
-			data, err := Decode(b32)
+			compressed, err := Decode(b32)
 			if err != nil {
 				return nil, fmt.Errorf("decode data payload: %w", err)
 			}
-			q.Data = data
+			q.Data, err = decompressPayload(compressed)
+			if err != nil {
+				return nil, fmt.Errorf("decompress data payload: %w", err)
+			}
 		}
 
 	case CmdPoll:
@@ -209,10 +291,12 @@ func BuildResponse(status string, data []byte) string {
 	if len(data) == 0 {
 		return status
 	}
-	return status + ":" + Encode(data)
+	return status + ":" + Encode(compressPayload(data))
 }
 
 // ParseResponse splits a TXT response string into its status and optional payload.
+// Only DATA responses carry a base32-encoded compressed payload; all other statuses
+// (including ERR:message) carry plain-text after the colon.
 func ParseResponse(txt string) (status string, data []byte, err error) {
 	idx := strings.IndexByte(txt, ':')
 	if idx < 0 {
@@ -223,9 +307,19 @@ func ParseResponse(txt string) (status string, data []byte, err error) {
 	if rest == "" {
 		return status, nil, nil
 	}
-	data, err = Decode(rest)
+
+	if status != RespData {
+		// Non-DATA payloads (e.g. ERR:message) are plain text.
+		return status, []byte(rest), nil
+	}
+
+	compressed, err := Decode(rest)
 	if err != nil {
 		return "", nil, fmt.Errorf("decode response payload: %w", err)
+	}
+	data, err = decompressPayload(compressed)
+	if err != nil {
+		return "", nil, fmt.Errorf("decompress response payload: %w", err)
 	}
 	return status, data, nil
 }

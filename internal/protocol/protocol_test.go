@@ -43,6 +43,103 @@ func TestDecode_CaseInsensitive(t *testing.T) {
 	}
 }
 
+// ─── Compression (via Build/Parse round-trips) ───────────────────────────────
+
+// TestDataQuery_CompressiblePayload verifies that a highly compressible payload
+// produces a shorter QNAME than the raw base32 of the same data would.
+func TestDataQuery_CompressiblePayload(t *testing.T) {
+	domain := "t.example.com"
+	session := "aabbccdd"
+
+	// Highly compressible: 100 bytes of 'A'.
+	compressible := bytes.Repeat([]byte("A"), 100)
+	// Baseline: random-looking bytes that won't compress well.
+	incompressible := make([]byte, 100)
+	for i := range incompressible {
+		incompressible[i] = byte(i*7 + 13)
+	}
+
+	qCompressed := protocol.BuildDataQuery(session, 1, compressible, domain)
+	qRaw := protocol.BuildDataQuery(session, 2, incompressible, domain)
+
+	if len(qCompressed) >= len(qRaw) {
+		t.Errorf("expected compressible QNAME (%d) to be shorter than incompressible (%d)",
+			len(qCompressed), len(qRaw))
+	}
+
+	// Round-trip the compressed query.
+	q, err := protocol.ParseQuery(qCompressed+".", domain)
+	if err != nil {
+		t.Fatalf("ParseQuery (compressible): %v", err)
+	}
+	if !bytes.Equal(q.Data, compressible) {
+		t.Errorf("compressible round-trip failed: want %v, got %v", compressible, q.Data)
+	}
+
+	// Round-trip the raw (incompressible) query.
+	q2, err := protocol.ParseQuery(qRaw+".", domain)
+	if err != nil {
+		t.Fatalf("ParseQuery (incompressible): %v", err)
+	}
+	if !bytes.Equal(q2.Data, incompressible) {
+		t.Errorf("incompressible round-trip failed")
+	}
+}
+
+// TestResponse_CompressiblePayload verifies the same for TXT responses.
+func TestResponse_CompressiblePayload(t *testing.T) {
+	compressible := bytes.Repeat([]byte("HTTP/1.1 200 OK\r\n"), 5)
+	incompressible := make([]byte, len(compressible))
+	for i := range incompressible {
+		incompressible[i] = byte(i*13 + 7)
+	}
+
+	txtCompressed := protocol.BuildResponse(protocol.RespData, compressible)
+	txtRaw := protocol.BuildResponse(protocol.RespData, incompressible)
+
+	if len(txtCompressed) >= len(txtRaw) {
+		t.Errorf("expected compressible response (%d) to be shorter than incompressible (%d)",
+			len(txtCompressed), len(txtRaw))
+	}
+
+	// Round-trip compressible.
+	status, data, err := protocol.ParseResponse(txtCompressed)
+	if err != nil {
+		t.Fatalf("ParseResponse (compressible): %v", err)
+	}
+	if status != protocol.RespData {
+		t.Errorf("status: want %q, got %q", protocol.RespData, status)
+	}
+	if !bytes.Equal(data, compressible) {
+		t.Errorf("compressible response round-trip failed")
+	}
+
+	// Round-trip incompressible.
+	status2, data2, err := protocol.ParseResponse(txtRaw)
+	if err != nil {
+		t.Fatalf("ParseResponse (incompressible): %v", err)
+	}
+	if status2 != protocol.RespData {
+		t.Errorf("status: want %q, got %q", protocol.RespData, status2)
+	}
+	if !bytes.Equal(data2, incompressible) {
+		t.Errorf("incompressible response round-trip failed")
+	}
+}
+
+// TestDataQuery_EmptyPayload ensures zero-length payloads still round-trip.
+func TestDataQuery_EmptyPayload(t *testing.T) {
+	domain := "tunnel.example.com"
+	qname := protocol.BuildDataQuery("aabbccdd", 5, []byte{}, domain)
+	q, err := protocol.ParseQuery(qname+".", domain)
+	if err != nil {
+		t.Fatalf("ParseQuery (empty): %v", err)
+	}
+	if len(q.Data) != 0 {
+		t.Errorf("expected empty data, got %v", q.Data)
+	}
+}
+
 // ─── Connect query ───────────────────────────────────────────────────────────
 
 func TestBuildParseConnectQuery(t *testing.T) {
