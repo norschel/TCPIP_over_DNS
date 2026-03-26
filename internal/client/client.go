@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -23,15 +24,25 @@ import (
 
 // session holds client-side state for one tunneled TCP connection.
 type session struct {
-	id  string
-	seq uint32 // monotonically increasing sequence number for upstream data
+	id     string
+	seq    uint32 // monotonically increasing sequence number for upstream data
+	target string // "host:port" requested by the application
 
 	// sendBuf buffers data read from the local SOCKS5 connection,
 	// waiting to be sent upstream via DNS queries.
-	sendBuf []byte
-	mu      sync.Mutex
+	sendBuf  []byte
+	mu       sync.Mutex
+	connTime time.Time
 
 	closed bool
+
+	// Traffic counters — updated only inside the relay loop (single goroutine),
+	// so no additional synchronisation is needed.
+	upBytes      int64 // raw payload bytes sent upstream (before encoding)
+	downBytes    int64 // raw payload bytes received downstream (after decoding)
+	dataQueries  int64 // DNS data queries issued (carry upstream payload)
+	pollQueries  int64 // DNS poll queries issued (no payload)
+	qnameBytes   int64 // sum of QNAME lengths sent (DNS wire overhead proxy)
 }
 
 // Client is the DNS tunnel client / SOCKS5 proxy.
@@ -86,7 +97,11 @@ func (c *Client) handleConn(conn net.Conn) {
 
 	log.Printf("[client] SOCKS5 CONNECT -> %s:%d", host, port)
 
-	sess := &session{id: newSessionID()}
+	sess := &session{
+		id:       newSessionID(),
+		target:   net.JoinHostPort(host, strconv.Itoa(int(port))),
+		connTime: time.Now(),
+	}
 
 	// Establish the tunnel connection on the server side.
 	if err := c.dnsConnect(sess, host, port); err != nil {
@@ -121,6 +136,8 @@ func (c *Client) dnsConnect(sess *session, host string, port uint16) error {
 
 // relay bidirectionally relays data between localConn and the DNS tunnel.
 func (c *Client) relay(localConn net.Conn, sess *session) {
+	defer sess.logSummary()
+
 	// Reader goroutine: continuously reads from the local connection and
 	// appends received bytes to sess.sendBuf.
 	go func() {
@@ -193,6 +210,11 @@ func (c *Client) relay(localConn net.Conn, sess *session) {
 			continue
 		}
 
+		// Count upstream payload after a successful send.
+		if len(chunk) > 0 && (status == protocol.RespData || status == protocol.RespAck) {
+			sess.upBytes += int64(len(chunk))
+		}
+
 		switch status {
 		case protocol.RespEOF:
 			log.Printf("[client] session %s: upstream EOF", sess.id)
@@ -201,6 +223,7 @@ func (c *Client) relay(localConn net.Conn, sess *session) {
 			log.Printf("[client] session %s: server error: %s", sess.id, string(data))
 			return
 		case protocol.RespData:
+			sess.downBytes += int64(len(data))
 			if _, err := localConn.Write(data); err != nil {
 				log.Printf("[client] session %s local write: %v", sess.id, err)
 				c.dnsClose(sess)
@@ -218,11 +241,15 @@ func (c *Client) relay(localConn net.Conn, sess *session) {
 func (c *Client) dnsSend(sess *session, data []byte) (string, error) {
 	sess.seq++
 	qname := protocol.BuildDataQuery(sess.id, sess.seq, data, c.domain)
+	sess.dataQueries++
+	sess.qnameBytes += int64(len(qname))
 	return c.queryTXT(qname)
 }
 
 func (c *Client) dnsPoll(sess *session) (string, error) {
 	qname := protocol.BuildPollQuery(sess.id, sess.seq, c.domain)
+	sess.pollQueries++
+	sess.qnameBytes += int64(len(qname))
 	return c.queryTXT(qname)
 }
 
@@ -251,6 +278,26 @@ func (c *Client) queryTXT(qname string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no TXT record in response for %q", qname)
+}
+
+// logSummary emits a structured statistics log line for the session.
+//
+// Example output:
+//
+//	[client] session a1b2c3d4 CLOSED | target=example.com:443 | duration=3.2s | up=4096B down=2048B | queries=data:45 poll:12 | qname_bytes=12800 | upstream_efficiency=32%
+func (s *session) logSummary() {
+	duration := time.Since(s.connTime).Round(time.Millisecond)
+
+	// upstream efficiency = raw payload bytes / QNAME bytes sent for data queries.
+	// Shows what fraction of DNS traffic carries real data (higher = more efficient).
+	efficiency := "N/A"
+	if s.qnameBytes > 0 {
+		efficiency = fmt.Sprintf("%d%%", s.upBytes*100/s.qnameBytes)
+	}
+
+	log.Printf("[client] session %s CLOSED | target=%s | duration=%s | up=%dB down=%dB | queries=data:%d poll:%d | qname_bytes=%d | upstream_efficiency=%s",
+		s.id, s.target, duration, s.upBytes, s.downBytes,
+		s.dataQueries, s.pollQueries, s.qnameBytes, efficiency)
 }
 
 // newSessionID generates a random 8-character lowercase hex session ID using
